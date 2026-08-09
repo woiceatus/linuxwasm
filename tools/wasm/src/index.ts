@@ -18,6 +18,11 @@ import {
   MachineTerminationReason,
   type UserContext,
 } from "./wasm.ts";
+import {
+  createFramebufferHost,
+  framebuffer_imports,
+  type FramebufferOptions,
+} from "./framebuffer.ts";
 import type {
   ForwardedInitMessage,
   InitMessage,
@@ -65,6 +70,39 @@ export {
   type VsockDevice,
   vsockDevice,
 } from "./virtio/vsock.ts";
+export {
+  Abs,
+  Ev,
+  inputDevice,
+  type InputDevice,
+  Key,
+  Rel,
+  Syn,
+} from "./virtio/input.ts";
+export {
+  createFramebufferHost,
+  swizzle_bgra_to_rgba,
+  type FramebufferCanvas,
+  type FramebufferHost,
+  type FramebufferOptions,
+} from "./framebuffer.ts";
+export {
+  attach_guest,
+  connectTcpOverWebSocket,
+  createNetwork,
+  resolveDnsOverProxy,
+  wsTcpProxyNetwork,
+  type GuestNetwork,
+  type Network,
+  type NetworkAddress,
+  type NetworkOptions,
+  type TcpConnection,
+  type TcpConnectOptions,
+  type TcpSession,
+  type UdpConnection,
+  type UdpConnectOptions,
+  type WsTcpProxyOptions,
+} from "./network/index.ts";
 
 type MaybePromise<T> = T | PromiseLike<T>;
 
@@ -80,6 +118,11 @@ export interface SpawnMachineOptions {
   initcpio?: MaybePromise<ArrayBufferView>;
   /** Recursively merged over the generated device tree before boot. */
   devicetree?: DeviceTreeNode;
+  /**
+   * Optional browser canvas for the wasm framebuffer (`/dev/fb0`).
+   * When omitted the guest still gets a headless 1024×768×32 fb.
+   */
+  framebuffer?: FramebufferOptions;
 }
 
 /**
@@ -212,6 +255,12 @@ export async function spawnMachine(
   let failed = false;
   let finish_error: unknown;
   let finish_promise: Promise<void> | undefined;
+  let framebuffer_host: ReturnType<typeof createFramebufferHost> | null = null;
+  const framebuffer_mode = {
+    width: options.framebuffer?.width ?? 1024,
+    height: options.framebuffer?.height ?? 768,
+    bpp: options.framebuffer?.bpp ?? 32,
+  };
 
   const closed_promise = Promise.withResolvers<void>();
   // Lifecycle promises on platform objects do not cause unhandled rejections
@@ -231,6 +280,8 @@ export async function spawnMachine(
     if (finish_promise) return finish_promise;
     closed = true;
     finish_promise = (async () => {
+      framebuffer_host?.close();
+      framebuffer_host = null;
       const device_closes = devices.map((device) => close_virtio_device(device));
       for (const result of await Promise.allSettled(device_closes)) {
         if (result.status === "rejected" && !failed) {
@@ -337,6 +388,7 @@ export async function spawnMachine(
     // The imports must exist before instantiation returns the instance they
     // call back into, but they only run once exports.boot() starts the kernel.
     let instance: Instance | undefined;
+    let virtio_config_written: ((dev: number) => void) | undefined;
 
     const start_worker = (
       name: string,
@@ -385,6 +437,18 @@ export async function spawnMachine(
                 message.arg,
               );
               break;
+            case "virtio_config_written":
+              try {
+                assert(virtio_config_written);
+                virtio_config_written(message.dev);
+                Atomics.store(message.status, 0, 1);
+              } catch (error) {
+                Atomics.store(message.status, 0, -1);
+                void fail(error);
+              } finally {
+                Atomics.notify(message.status, 0);
+              }
+              break;
             case "worker_exit": {
               // The worker closes itself after posting this message. Calling
               // terminate() here races that orderly shutdown and leaks the
@@ -423,6 +487,7 @@ export async function spawnMachine(
         memory: wasm_memory,
         user,
         user_copy_status: null,
+        framebuffer: framebuffer_mode,
       });
       return 0;
     };
@@ -481,15 +546,34 @@ export async function spawnMachine(
         futex_atomic_op: unavailable,
         futex_atomic_cmpxchg: unavailable,
       },
-      virtio: virtio_imports({
-        memory: wasm_memory,
-        devices,
-        on_error: fail,
-        trigger_irq(irq) {
-          assert(instance);
-          instance.exports.trigger_irq(irq);
-        },
-      }),
+      virtio: (() => {
+        const imports = virtio_imports({
+          memory: wasm_memory,
+          devices,
+          on_error: fail,
+          trigger_irq(irq) {
+            assert(instance);
+            instance.exports.trigger_irq(irq);
+          },
+        });
+        virtio_config_written = imports.config_written;
+        return imports;
+      })(),
+      fb: (() => {
+        if (options.framebuffer) {
+          framebuffer_host = createFramebufferHost(wasm_memory, {
+            ...options.framebuffer,
+            width: framebuffer_mode.width,
+            height: framebuffer_mode.height,
+            bpp: framebuffer_mode.bpp,
+          });
+        }
+        return framebuffer_imports(
+          wasm_memory,
+          framebuffer_host,
+          framebuffer_mode,
+        );
+      })(),
     } satisfies Imports;
 
     instance = (await WebAssembly.instantiate(vmlinux, imports)) as Instance;
